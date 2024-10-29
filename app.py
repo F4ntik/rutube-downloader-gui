@@ -38,11 +38,14 @@ class ToolTip:
 
 # Класс для отслеживания прогресса записи файла
 class ProgressFile:
-    def __init__(self, file, callback):
+    def __init__(self, file, callback, stop_event):
         self.file = file
         self.callback = callback
+        self.stop_event = stop_event
 
     def write(self, data):
+        if self.stop_event.is_set():
+            raise Exception("Скачивание остановлено пользователем.")
         self.file.write(data)
         self.callback(len(data))
 
@@ -75,11 +78,10 @@ class RutubeDownloaderGUI:
 
         self.url_entry = tk.Entry(self.url_frame, width=50)
         self.url_entry.pack(side='left', padx=(5, 0))
-        self.url_entry.bind("<FocusOut>", self.fetch_resolutions)
         self.url_entry.bind("<Return>", self.fetch_resolutions)  # Запуск при нажатии Enter
 
         # Кнопка для запуска обработки ссылки
-        self.process_button = tk.Button(self.url_frame, text=" ▶", width=2, command=self.fetch_resolutions)
+        self.process_button = tk.Button(self.url_frame, text="▶", width=2, command=self.fetch_resolutions)
         self.process_button.pack(side='left', padx=(5, 0))
 
         # Эмодзи для индикации состояния
@@ -154,13 +156,25 @@ class RutubeDownloaderGUI:
         self.extension_label = tk.Label(self.filename_frame, text=".mp4")
         self.extension_label.pack(side='left', padx=(5, 0))
 
-        # Кнопка скачивания
-        self.download_button = tk.Button(self.main_frame, text="Начать скачивание", command=self.start_download, width=25)
-        self.download_button.pack(pady=20)
+        # Кнопки скачивания и остановки на одной линии
+        self.download_frame = tk.Frame(self.main_frame)
+        self.download_frame.pack(pady=10, fill='x')
 
-        # Прогресс-бар
-        self.progress_bar = ttk.Progressbar(self.main_frame, orient='horizontal', length=650, mode='determinate')
-        self.progress_bar.pack(pady=10)
+        self.download_button = tk.Button(self.download_frame, text="Начать скачивание", command=self.start_download, width=20)
+        self.download_button.pack(side='left', padx=(0, 10))
+
+        self.stop_button = tk.Button(self.download_frame, text="Остановить скачивание", command=self.stop_download, width=20, state='disabled')
+        self.stop_button.pack(side='left')
+
+        # Прогресс-бар с наложенным текстом
+        self.progress_frame = tk.Frame(self.main_frame)
+        self.progress_frame.pack(pady=10, fill='x')
+
+        self.progress_bar = ttk.Progressbar(self.progress_frame, orient='horizontal', length=650, mode='determinate')
+        self.progress_bar.pack()
+
+        self.progress_label = tk.Label(self.progress_frame, text="0.00 MB", bg="#ffffff")
+        self.progress_label.place(relx=0.5, rely=0.5, anchor='center')
 
         # Лог-терминал
         self.log_label = tk.Label(self.main_frame, text="Лог:")
@@ -172,11 +186,10 @@ class RutubeDownloaderGUI:
         self.download_thread = None
         self.downloading = False
         self.output_path = ""
-        self.total_bytes = 0
-        self.downloaded_bytes = 0
+        self.stop_event = threading.Event()
+        self.last_chunks = -1  # Для отслеживания последнего количества чанков
 
     def show_help(self):
-        # Дополнительная логика при нажатии на кнопку "?"
         pass  # Подсказка уже реализована через ToolTip
 
     def browse_directory(self):
@@ -185,10 +198,6 @@ class RutubeDownloaderGUI:
             self.save_path.set(directory)
 
     def normalize_url(self, url):
-        """
-        Нормализует введенную пользователем ссылку.
-        Добавляет 'https://' если отсутствует.
-        """
         url = url.strip()
         if not url:
             return ""
@@ -196,9 +205,7 @@ class RutubeDownloaderGUI:
             if "rutube.ru/video/" in url:
                 url = "https://" + url
             else:
-                # Предполагаем, что это ID видео
                 url = f"https://rutube.ru/video/{url}/"
-        # Убедимся, что URL заканчивается '/'
         if not url.endswith("/"):
             url += "/"
         return url
@@ -215,13 +222,12 @@ class RutubeDownloaderGUI:
         self.url_entry.insert(0, normalized_url)
         self.status_emoji.config(text="⏳", fg="orange")
         self.log(f"Обрабатываем URL: {normalized_url}")
-        # Запуск в отдельном потоке, чтобы не блокировать GUI
         threading.Thread(target=self.get_resolutions, args=(normalized_url,), daemon=True).start()
 
     def get_resolutions(self, url):
         try:
             rt = Rutube(url)
-            video = rt.get_best()  # Получаем информацию о видео
+            video = rt.get_best()
             if not video:
                 raise Exception("Видео не найдено.")
             resolutions = rt.available_resolutions
@@ -229,18 +235,14 @@ class RutubeDownloaderGUI:
                 raise Exception("Нет доступных разрешений.")
             resolutions_sorted = sorted(resolutions)
             self.resolution_dropdown['values'] = resolutions_sorted
-            # Установить значение по умолчанию
             self.resolution.set(resolutions_sorted[-1])
-            # Если режим custom выбран, включить выпадающий список
             if self.mode.get() == "custom":
                 self.resolution_dropdown.config(state='readonly')
             else:
                 self.resolution_dropdown.config(state='disabled')
-            # Установить название файла
             sanitized_title = self.sanitize_filename(video.title)
             self.filename_entry.delete(0, tk.END)
             self.filename_entry.insert(0, sanitized_title)
-            # Успешно получили разрешения
             self.status_emoji.config(text="✅", fg="green")
             self.log(f"Доступные разрешения: {', '.join(map(str, resolutions_sorted))}")
         except Exception as e:
@@ -252,9 +254,6 @@ class RutubeDownloaderGUI:
             self.log(f"Ошибка при получении разрешений: {e}", error=True)
 
     def sanitize_filename(self, name):
-        """
-        Удаляет недопустимые символы из имени файла.
-        """
         return "".join(c for c in name if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
 
     def update_mode(self):
@@ -286,25 +285,35 @@ class RutubeDownloaderGUI:
             self.log("Пользователь не указал название файла.", error=True)
             return
 
-        # Проверка на наличие запрещенных символов в названии файла
         if any(c in filename for c in r'\/:*?"<>|'):
             messagebox.showwarning("Предупреждение", "Название файла содержит недопустимые символы (\\ / : * ? \" < > |).")
             self.log("Название файла содержит недопустимые символы.", error=True)
             return
 
-        # Запуск скачивания в отдельном потоке
+        self.stop_event.clear()
         self.download_thread = threading.Thread(target=self.download_video, args=(url, save_dir, mode, resolution, filename), daemon=True)
         self.download_thread.start()
+        self.download_button.config(state='disabled')
+        self.stop_button.config(state='normal')
+        self.progress_bar.config(mode='determinate')  # Устанавливаем режим determinate
+        self.progress_bar['value'] = 0  # Сбрасываем прогресс бар
+        self.progress_bar['maximum'] = 100  # Устанавливаем максимальное значение
+        self.log("Начало скачивания...")  # Удалён дублирующий вызов
+
+    def stop_download(self):
+        if self.downloading:
+            self.stop_event.set()
+            self.log("Запрос на остановку скачивания.")
+            self.stop_button.config(state='disabled')
 
     def download_video(self, url, save_dir, mode, resolution, filename):
         try:
-            self.download_button.config(state='disabled')
-            self.size_label.config(text="Размер файла: 0.00 MB")
-            self.progress_bar['value'] = 0
-            self.progress_bar.config(mode='indeterminate')
-            self.progress_bar.start(10)
             self.downloading = True
-            self.log("Начало скачивания...")
+            self.downloaded_bytes = 0
+            self.last_chunks = -1  # Сброс последнего количества чанков
+            self.progress_bar['value'] = 0
+            self.progress_label.config(text="0.00 MB")
+            # Удалён дублирующий вызов log("Начало скачивания...")
 
             rt = Rutube(url)
 
@@ -322,50 +331,85 @@ class RutubeDownloaderGUI:
             if not video:
                 raise Exception("Видео не найдено.")
 
-            # Установить название файла с расширением
             output_filename = f"{filename}.mp4"
             desired_filepath = os.path.join(save_dir, output_filename)
             self.output_path = desired_filepath
 
+            total_size = self.get_total_size(rt, video)
+            if total_size:
+                self.progress_bar.config(mode='determinate', maximum=total_size)
+            else:
+                self.progress_bar.config(mode='indeterminate')
+                self.progress_bar.start(10)
+
             # Обёртка для отслеживания прогресса
             def progress_callback(bytes_written):
+                if self.stop_event.is_set():
+                    raise Exception("Скачивание остановлено пользователем.")
                 self.downloaded_bytes += bytes_written
                 size_mb = self.downloaded_bytes / (1024 * 1024)
-                self.root.after(0, lambda: self.size_label.config(text=f"Размер файла: {size_mb:.2f} MB"))
+                self.root.after(0, lambda: self.progress_label.config(text=f"{size_mb:.2f} MB"))
+                if total_size:
+                    self.root.after(0, lambda: self.progress_bar.step(bytes_written))
+                chunks = self.downloaded_bytes // (1024 * 1024)  # Предполагаем, что 1 chunk = 1 MB
+                if chunks != self.last_chunks and chunks > 0:
+                    self.last_chunks = chunks
+                    self.root.after(0, lambda: self.log(f"Скачано чанков: {chunks}"))
 
-            self.downloaded_bytes = 0
             with open(desired_filepath, 'wb') as f:
-                progress_file = ProgressFile(f, progress_callback)
+                progress_file = ProgressFile(f, progress_callback, self.stop_event)
                 video.download(stream=progress_file)
 
-            # Завершение скачивания
-            self.downloading = False
-            self.progress_bar.stop()
-            self.progress_bar.config(mode='determinate')
-            self.progress_bar['value'] = 100
-            size = os.path.getsize(self.output_path) / (1024 * 1024)  # В MB
-            self.size_label.config(text=f"Размер файла: {size:.2f} MB")
-            self.log(f"Видео успешно скачано: {self.output_path}")
-            self.show_success_dialog()
-
+            if self.stop_event.is_set():
+                self.log("Скачивание остановлено пользователем.", error=True)
+                if os.path.exists(desired_filepath):
+                    os.remove(desired_filepath)  # Удаление частично скачанного файла
+                if self.progress_bar['mode'] == 'indeterminate':
+                    self.progress_bar.stop()
+                self.progress_bar['value'] = 0
+                self.progress_label.config(text="0.00 MB")
+                messagebox.showinfo("Остановлено", "Скачивание было остановлено.")
+            else:
+                size = os.path.getsize(self.output_path) / (1024 * 1024)
+                if total_size:
+                    self.progress_bar['value'] = total_size
+                else:
+                    self.progress_bar.stop()
+                self.progress_label.config(text=f"{size:.2f} MB")
+                self.log(f"Видео успешно скачано: {self.output_path}")
+                self.show_success_dialog()
         except Exception as e:
-            self.size_label.config(text="Размер файла: 0.00 MB")
-            self.progress_bar.stop()
-            self.progress_bar.config(mode='determinate')
+            if self.progress_bar['mode'] == 'indeterminate':
+                self.progress_bar.stop()
             self.progress_bar['value'] = 0
-            self.downloading = False
+            self.progress_label.config(text="0.00 MB")
+            if os.path.exists(desired_filepath):
+                os.remove(desired_filepath)  # Удаление частично скачанного файла
             self.log(f"Ошибка при скачивании: {e}", error=True)
             messagebox.showerror("Ошибка", f"Не удалось скачать видео: {e}")
         finally:
             self.download_button.config(state='normal')
+            self.stop_button.config(state='disabled')
+            self.downloading = False
+
+    def get_total_size(self, rt, video):
+        """
+        Попытка получить общий размер видео в байтах.
+        Если невозможно, возвращает None.
+        """
+        try:
+            # Здесь предполагается, что RutubeVideo имеет атрибут 'size'
+            # Если нет, возможно, потребуется другой способ получения размера
+            return video.size if hasattr(video, 'size') else None
+        except:
+            return None
 
     def show_success_dialog(self):
-        # Создание кастомного диалога с кнопкой "Открыть папку"
         success_dialog = tk.Toplevel(self.root)
         success_dialog.title("Успех")
         success_dialog.geometry("400x150")
         success_dialog.resizable(False, False)
-        success_dialog.grab_set()  # Блокирует взаимодействие с другими окнами
+        success_dialog.grab_set()
 
         message = tk.Label(success_dialog, text="Видео успешно скачано!", font=("Arial", 12))
         message.pack(pady=20)
@@ -377,7 +421,6 @@ class RutubeDownloaderGUI:
         close_button.pack(pady=5)
 
     def open_folder(self):
-        # Открытие папки с сохранённым файлом
         folder_path = os.path.dirname(self.output_path)
         if os.path.exists(folder_path):
             webbrowser.open(folder_path)
@@ -394,9 +437,6 @@ class RutubeDownloaderGUI:
             self.log_text.insert(tk.END, f"✅ {message}\n")
         self.log_text.config(state='disabled')
         self.log_text.see(tk.END)
-
-    def run(self):
-        pass  # Нет необходимости в дополнительных методах
 
 if __name__ == "__main__":
     root = tk.Tk()
